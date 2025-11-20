@@ -172,9 +172,10 @@ function AnalysisDetail() {
                   href={analysis.report_path}
                   download
                   className="btn btn-secondary flex items-center gap-2"
+                  title="Download Word Report"
                 >
                   <Download className="h-4 w-4" />
-                  Report
+                  Download Report
                 </a>
               )}
               {analysis.dashboard_path && (
@@ -183,9 +184,10 @@ function AnalysisDetail() {
                   target="_blank"
                   rel="noopener noreferrer"
                   className="btn btn-primary flex items-center gap-2"
+                  title="Open Interactive Dashboard"
                 >
                   <ExternalLink className="h-4 w-4" />
-                  Dashboard
+                  View Dashboard
                 </a>
               )}
             </div>
