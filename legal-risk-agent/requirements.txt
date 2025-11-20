@@ -1,0 +1,12 @@
+# Core dependencies for Legal Risk Analysis Deep Agent System
+deepagents
+tavily-python
+python-docx
+langgraph
+langchain-anthropic
+
+# For managing API keys
+python-dotenv
+
+# For image processing in data room tools
+Pillow
