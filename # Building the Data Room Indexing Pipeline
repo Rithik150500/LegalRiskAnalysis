@@ -1,0 +1,1036 @@
+# Building the Data Room Indexing Pipeline
+
+Before your Legal Risk Analysis Deep Agent can work its magic, you need to prepare the raw documents into a structured format that the agent can efficiently navigate. Think of this indexing process as creating a detailed table of contents with intelligent summaries at multiple levels of granularity. This preprocessing step transforms a chaotic collection of files into an organized, searchable data room that enables strategic analysis.
+
+The indexing pipeline I'm going to build performs several sophisticated operations in sequence. First, it normalizes all documents to a common format by converting them to PDF. Then it extracts each page as an individual image, which allows the system to process visual content that might not be accessible through pure text extraction. Next, it uses a vision-capable language model to understand and summarize each page, capturing both textual content and visual elements like charts, diagrams, or formatting that conveys meaning. Finally, it synthesizes these page-level summaries into document-level overviews, creating a hierarchical structure that supports both high-level strategic planning and detailed drill-down analysis.
+
+Let me walk you through building this system step by step, explaining the architectural decisions and implementation details as we go.
+
+## Understanding the Architecture
+
+The indexing pipeline consists of five distinct stages, each building on the previous one. The first stage handles document conversion, ensuring that all input files—whether they're Word documents, Excel spreadsheets, or PowerPoint presentations—end up in a consistent PDF format. The second stage extracts individual pages from these PDFs as high-quality images. The third stage uses a vision-capable language model to analyze each page image and generate a concise summary that captures the essential information. The fourth stage takes all the page summaries for a document and synthesizes them into a coherent document-level summary. The final stage assembles all this information into the structured data room index that our deep agent expects.
+
+This architecture is designed with several important principles in mind. First, it maintains the visual fidelity of the original documents by working with images rather than relying solely on text extraction, which can lose formatting, tables, charts, and other visual elements that are crucial for legal documents. Second, it creates summaries at multiple levels of granularity, allowing the analysis agent to quickly scan documents at a high level and then drill down to specific pages when needed. Third, it's fault-tolerant, handling errors in individual documents without derailing the entire indexing process. Fourth, it's token-efficient, using a smaller, faster model for the page-level analysis tasks and reserving the more powerful models for the actual legal analysis.
+
+## Implementation: Building Each Component
+
+Let me now build out the complete indexing system, starting with the foundational components and working up to the full pipeline.
+
+```python
+# data_room_indexer.py
+import os
+import subprocess
+import tempfile
+import base64
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from PIL import Image
+import fitz  # PyMuPDF for PDF processing
+from openai import OpenAI
+import json
+from dataclasses import dataclass, asdict
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Set up logging so we can track progress through large document sets
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class PageInfo:
+    """
+    Represents a single page within a document.
+    
+    This structure matches what our Legal Risk Analysis agent expects.
+    Each page has a number (for reference), a summary description (for 
+    quick scanning), and the image data (for detailed analysis).
+    """
+    page_num: int
+    summdesc: str
+    page_image: str  # Base64-encoded image data
+
+@dataclass
+class DocumentInfo:
+    """
+    Represents a complete document in the data room.
+    
+    The document has an ID for reference, a high-level summary that 
+    synthesizes all page summaries, and the collection of individual pages.
+    This hierarchical structure allows both strategic planning (using 
+    doc_id and summdesc) and detailed analysis (drilling into specific pages).
+    """
+    doc_id: str
+    summdesc: str
+    pages: List[PageInfo]
+
+class DocumentConverter:
+    """
+    Handles conversion of various document formats to PDF using LibreOffice.
+    
+    LibreOffice is a powerful open-source office suite that can convert
+    virtually any document format to PDF. By using it programmatically,
+    we can normalize all inputs to a consistent format that's easy to
+    process downstream.
+    """
+    
+    def __init__(self, libreoffice_path: Optional[str] = None):
+        """
+        Initialize the converter with the path to LibreOffice.
+        
+        Args:
+            libreoffice_path: Path to the LibreOffice executable. If None,
+                            we'll try to find it in common locations.
+        """
+        self.libreoffice_path = libreoffice_path or self._find_libreoffice()
+        
+        if not self.libreoffice_path:
+            raise RuntimeError(
+                "LibreOffice not found. Please install LibreOffice or provide "
+                "the path to the executable."
+            )
+        
+        logger.info(f"Using LibreOffice at: {self.libreoffice_path}")
+    
+    def _find_libreoffice(self) -> Optional[str]:
+        """
+        Attempt to locate LibreOffice in common installation paths.
+        
+        Different operating systems install LibreOffice in different locations,
+        so we need to check several possibilities. This makes the system more
+        portable across development and production environments.
+        """
+        # Common LibreOffice paths on different operating systems
+        possible_paths = [
+            # Linux
+            "/usr/bin/libreoffice",
+            "/usr/bin/soffice",
+            # macOS
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            # Windows
+            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        
+        return None
+    
+    def convert_to_pdf(self, input_path: str, output_dir: str) -> str:
+        """
+        Convert a document to PDF format.
+        
+        This method handles the actual conversion process, dealing with the
+        quirks of running LibreOffice in headless mode. The conversion happens
+        in a subprocess, which isolates any potential issues from our main
+        application.
+        
+        Args:
+            input_path: Path to the input document
+            output_dir: Directory where the PDF should be saved
+            
+        Returns:
+            Path to the generated PDF file
+        """
+        # Ensure the output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # LibreOffice creates the output file with the same base name as the input
+        # but with a .pdf extension
+        input_file = Path(input_path)
+        expected_output = Path(output_dir) / f"{input_file.stem}.pdf"
+        
+        # If the input is already a PDF, just copy it
+        if input_file.suffix.lower() == '.pdf':
+            import shutil
+            shutil.copy2(input_path, expected_output)
+            logger.info(f"File already PDF, copied to: {expected_output}")
+            return str(expected_output)
+        
+        logger.info(f"Converting {input_path} to PDF...")
+        
+        # Build the LibreOffice command
+        # --headless: Run without a GUI
+        # --convert-to pdf: Convert to PDF format
+        # --outdir: Specify output directory
+        cmd = [
+            self.libreoffice_path,
+            '--headless',
+            '--convert-to', 'pdf',
+            '--outdir', output_dir,
+            input_path
+        ]
+        
+        try:
+            # Run the conversion with a timeout to prevent hanging
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"LibreOffice conversion failed: {result.stderr}"
+                )
+            
+            if not expected_output.exists():
+                raise RuntimeError(
+                    f"Conversion completed but output file not found: {expected_output}"
+                )
+            
+            logger.info(f"Successfully converted to: {expected_output}")
+            return str(expected_output)
+            
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"Conversion timed out after 300 seconds for: {input_path}"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Conversion error: {str(e)}")
+
+class PDFPageExtractor:
+    """
+    Extracts individual pages from PDF documents as images.
+    
+    We use PyMuPDF (fitz) for this because it provides high-quality rendering
+    of PDF pages to images. The quality of these images directly impacts how
+    well the vision model can understand the content, so we use a resolution
+    that balances quality with file size and processing time.
+    """
+    
+    def __init__(self, dpi: int = 150):
+        """
+        Initialize the extractor with a specific DPI setting.
+        
+        Args:
+            dpi: Dots per inch for rendering. 150 is a good balance between
+                 quality and file size. Lower values (72-96) are faster but
+                 may miss small text. Higher values (200-300) capture more
+                 detail but create larger images.
+        """
+        self.dpi = dpi
+        logger.info(f"PDF extractor initialized with {dpi} DPI")
+    
+    def extract_pages(self, pdf_path: str) -> List[Image.Image]:
+        """
+        Extract all pages from a PDF as PIL Image objects.
+        
+        Each page is rendered at the configured DPI and returned as a PIL
+        Image object that can be further processed or encoded for the API.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            List of PIL Image objects, one per page
+        """
+        logger.info(f"Extracting pages from: {pdf_path}")
+        
+        try:
+            # Open the PDF document
+            doc = fitz.open(pdf_path)
+            pages = []
+            
+            # Calculate the zoom factor from DPI
+            # PyMuPDF uses a zoom factor rather than DPI directly
+            # Standard PDF resolution is 72 DPI, so we calculate zoom accordingly
+            zoom = self.dpi / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+            
+            # Process each page
+            for page_num in range(len(doc)):
+                logger.info(f"Extracting page {page_num + 1}/{len(doc)}")
+                
+                # Get the page
+                page = doc[page_num]
+                
+                # Render the page to a pixmap (bitmap image)
+                pix = page.get_pixmap(matrix=matrix)
+                
+                # Convert pixmap to PIL Image
+                # PyMuPDF returns RGB data, which we can directly convert
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                
+                pages.append(img)
+            
+            doc.close()
+            logger.info(f"Successfully extracted {len(pages)} pages")
+            return pages
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to extract pages from {pdf_path}: {str(e)}")
+    
+    @staticmethod
+    def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
+        """
+        Convert a PIL Image to a base64-encoded string.
+        
+        The OpenAI API accepts images as base64-encoded data URLs, which is
+        more reliable than hosting images at URLs. We use PNG format for
+        lossless compression, though JPEG could be used for smaller file sizes
+        at the cost of some quality.
+        
+        Args:
+            image: PIL Image object
+            format: Image format for encoding (PNG or JPEG)
+            
+        Returns:
+            Base64-encoded image string
+        """
+        from io import BytesIO
+        
+        # Create an in-memory buffer
+        buffer = BytesIO()
+        
+        # Save the image to the buffer
+        image.save(buffer, format=format)
+        
+        # Get the bytes and encode as base64
+        image_bytes = buffer.getvalue()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        return base64_image
+
+class PageSummarizer:
+    """
+    Uses a vision-capable language model to generate summaries of document pages.
+    
+    This component is where the magic of understanding visual documents happens.
+    By sending page images to a vision model, we can extract meaning from
+    complex layouts, tables, charts, and formatted text that would be difficult
+    or impossible to process with pure text extraction.
+    """
+    
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        """
+        Initialize the summarizer with OpenAI credentials.
+        
+        Args:
+            api_key: OpenAI API key
+            model: Model to use for summarization. gpt-4o-mini is cost-effective
+                   and fast for this task. For higher quality, use gpt-4o.
+        """
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+        logger.info(f"Page summarizer initialized with model: {model}")
+    
+    def summarize_page(self, page_image_base64: str, page_num: int) -> str:
+        """
+        Generate a summary description of a single page.
+        
+        The prompt we use here is crucial. We want the model to capture:
+        - The type of content (text, table, chart, form, etc.)
+        - Key information present on the page
+        - Any visual elements that convey meaning
+        - Context clues that help understand the document's purpose
+        
+        We keep the summary concise (2-3 sentences) because these will be
+        aggregated, and we don't want the combined summary to become unwieldy.
+        
+        Args:
+            page_image_base64: Base64-encoded image of the page
+            page_num: Page number (for context in the prompt)
+            
+        Returns:
+            Summary description of the page
+        """
+        logger.info(f"Summarizing page {page_num}")
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are an expert document analyzer. Generate concise, 
+informative summaries of document pages. Focus on:
+- The type of content (contract terms, financial data, correspondence, etc.)
+- Key information visible on the page
+- Important legal, financial, or operational details
+- Any visual elements like charts, tables, or diagrams
+
+Keep summaries to 2-3 sentences that capture the essence of what's on the page."""
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Summarize what you see on page {page_num} of this document."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{page_image_base64}",
+                                    "detail": "high"  # Use high detail for better accuracy
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=200  # Keep summaries concise
+            )
+            
+            summary = response.choices[0].message.content.strip()
+            logger.info(f"Page {page_num} summary: {summary[:100]}...")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Failed to summarize page {page_num}: {str(e)}")
+            # Return a fallback summary rather than failing completely
+            return f"Page {page_num}: Unable to generate summary due to processing error."
+
+class DocumentSummarizer:
+    """
+    Synthesizes page-level summaries into document-level summaries.
+    
+    This component takes all the individual page summaries and asks the model
+    to create a coherent overview of the entire document. This is a text-only
+    task (no images), so it's faster and cheaper than the page analysis.
+    """
+    
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        """
+        Initialize the document summarizer.
+        
+        Args:
+            api_key: OpenAI API key
+            model: Model to use for summarization
+        """
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+        logger.info(f"Document summarizer initialized with model: {model}")
+    
+    def summarize_document(
+        self, 
+        page_summaries: List[str], 
+        document_name: str
+    ) -> str:
+        """
+        Create a document-level summary from page summaries.
+        
+        The challenge here is synthesizing multiple page-level observations into
+        a coherent narrative about what the document is and what it contains.
+        We want to capture the document type, its purpose, key provisions or
+        information, and anything that seems legally or operationally significant.
+        
+        Args:
+            page_summaries: List of summaries for each page
+            document_name: Name of the document (for context)
+            
+        Returns:
+            Summary description of the entire document
+        """
+        logger.info(f"Creating document-level summary for: {document_name}")
+        
+        # Combine all page summaries into a structured format
+        combined_summaries = "\n".join([
+            f"Page {i+1}: {summary}" 
+            for i, summary in enumerate(page_summaries)
+        ])
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are an expert at synthesizing document analysis. 
+Given summaries of individual pages, create a concise document-level summary that captures:
+- The type of document (contract, agreement, correspondence, financial statement, etc.)
+- The parties involved (if applicable)
+- The subject matter or purpose
+- Key terms, obligations, or information
+- Any notable provisions or details that would be important for legal risk analysis
+
+Keep the summary to 3-4 sentences that give a clear picture of what this document is and why it matters."""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Document: {document_name}
+
+Page Summaries:
+{combined_summaries}
+
+Create a comprehensive document-level summary."""
+                    }
+                ],
+                max_tokens=300
+            )
+            
+            summary = response.choices[0].message.content.strip()
+            logger.info(f"Document summary created: {summary[:100]}...")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Failed to create document summary: {str(e)}")
+            # Fallback: just concatenate the first few page summaries
+            return " ".join(page_summaries[:3]) + "..."
+
+class DataRoomIndexer:
+    """
+    Orchestrates the complete indexing pipeline.
+    
+    This is the main class that ties all the components together. It manages
+    the workflow from raw documents through conversion, page extraction,
+    summarization, and finally building the structured index.
+    """
+    
+    def __init__(
+        self,
+        openai_api_key: str,
+        libreoffice_path: Optional[str] = None,
+        model: str = "gpt-4o-mini",
+        dpi: int = 150,
+        max_workers: int = 3
+    ):
+        """
+        Initialize the indexer with all necessary components.
+        
+        Args:
+            openai_api_key: OpenAI API key for summarization
+            libreoffice_path: Path to LibreOffice executable
+            model: OpenAI model to use for summarization
+            dpi: Resolution for PDF page extraction
+            max_workers: Number of parallel workers for page processing
+        """
+        self.converter = DocumentConverter(libreoffice_path)
+        self.extractor = PDFPageExtractor(dpi)
+        self.page_summarizer = PageSummarizer(openai_api_key, model)
+        self.doc_summarizer = DocumentSummarizer(openai_api_key, model)
+        self.max_workers = max_workers
+        
+        logger.info("Data Room Indexer initialized successfully")
+    
+    def process_document(
+        self, 
+        file_path: str, 
+        doc_id: str,
+        temp_dir: str
+    ) -> DocumentInfo:
+        """
+        Process a single document through the complete pipeline.
+        
+        This method orchestrates all the steps: conversion to PDF, page
+        extraction, page summarization, and document summarization. It's
+        designed to be fault-tolerant, catching and logging errors rather
+        than crashing the entire indexing process.
+        
+        Args:
+            file_path: Path to the source document
+            doc_id: Unique identifier for this document
+            temp_dir: Temporary directory for intermediate files
+            
+        Returns:
+            DocumentInfo object containing the indexed document data
+        """
+        logger.info(f"Processing document: {doc_id} from {file_path}")
+        
+        try:
+            # Step 1: Convert to PDF
+            pdf_path = self.converter.convert_to_pdf(file_path, temp_dir)
+            
+            # Step 2: Extract pages as images
+            page_images = self.extractor.extract_pages(pdf_path)
+            logger.info(f"Extracted {len(page_images)} pages from {doc_id}")
+            
+            # Step 3: Summarize each page
+            # We'll process pages in parallel to speed things up
+            page_infos = []
+            
+            # Convert images to base64 first (this is fast and doesn't need parallelization)
+            page_images_b64 = [
+                self.extractor.image_to_base64(img) 
+                for img in page_images
+            ]
+            
+            # Now summarize pages in parallel
+            logger.info(f"Summarizing {len(page_images_b64)} pages...")
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all summarization tasks
+                future_to_page = {
+                    executor.submit(
+                        self.page_summarizer.summarize_page,
+                        img_b64,
+                        page_num + 1
+                    ): (page_num, img_b64)
+                    for page_num, img_b64 in enumerate(page_images_b64)
+                }
+                
+                # Collect results as they complete
+                page_summaries = {}
+                for future in as_completed(future_to_page):
+                    page_num, img_b64 = future_to_page[future]
+                    try:
+                        summary = future.result()
+                        page_summaries[page_num] = summary
+                    except Exception as e:
+                        logger.error(f"Error summarizing page {page_num + 1}: {str(e)}")
+                        page_summaries[page_num] = f"Page {page_num + 1}: Summary unavailable"
+            
+            # Build PageInfo objects in the correct order
+            for page_num, img_b64 in enumerate(page_images_b64):
+                page_infos.append(PageInfo(
+                    page_num=page_num + 1,
+                    summdesc=page_summaries[page_num],
+                    page_image=img_b64
+                ))
+            
+            logger.info(f"Completed page summarization for {doc_id}")
+            
+            # Step 4: Create document-level summary
+            all_page_summaries = [pi.summdesc for pi in page_infos]
+            doc_summary = self.doc_summarizer.summarize_document(
+                all_page_summaries,
+                os.path.basename(file_path)
+            )
+            
+            # Step 5: Build and return DocumentInfo
+            doc_info = DocumentInfo(
+                doc_id=doc_id,
+                summdesc=doc_summary,
+                pages=page_infos
+            )
+            
+            logger.info(f"Successfully processed document: {doc_id}")
+            return doc_info
+            
+        except Exception as e:
+            logger.error(f"Failed to process document {doc_id}: {str(e)}")
+            raise
+    
+    def index_data_room(
+        self, 
+        documents: Dict[str, str],
+        output_path: Optional[str] = None
+    ) -> List[DocumentInfo]:
+        """
+        Index an entire data room of documents.
+        
+        This is the main entry point for indexing. You provide a dictionary
+        mapping document IDs to file paths, and this method processes each
+        document and returns the complete index.
+        
+        Args:
+            documents: Dictionary mapping doc_id to file_path
+            output_path: Optional path to save the index as JSON
+            
+        Returns:
+            List of DocumentInfo objects representing the indexed data room
+        """
+        logger.info(f"Starting data room indexing for {len(documents)} documents")
+        
+        # Create a temporary directory for intermediate files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger.info(f"Using temporary directory: {temp_dir}")
+            
+            indexed_documents = []
+            
+            for doc_id, file_path in documents.items():
+                try:
+                    doc_info = self.process_document(doc_id, file_path, temp_dir)
+                    indexed_documents.append(doc_info)
+                except Exception as e:
+                    logger.error(f"Skipping document {doc_id} due to error: {str(e)}")
+                    continue
+            
+            logger.info(f"Indexing complete. Successfully processed {len(indexed_documents)} documents")
+            
+            # Optionally save the index to a file
+            if output_path:
+                self._save_index(indexed_documents, output_path)
+            
+            return indexed_documents
+    
+    def _save_index(self, documents: List[DocumentInfo], output_path: str):
+        """
+        Save the indexed data room to a JSON file.
+        
+        This creates a persistent record of the index that can be loaded
+        later without re-processing all the documents.
+        
+        Args:
+            documents: List of indexed documents
+            output_path: Path where the JSON should be saved
+        """
+        logger.info(f"Saving index to: {output_path}")
+        
+        # Convert dataclasses to dictionaries
+        index_data = [asdict(doc) for doc in documents]
+        
+        # Write to file
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(index_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Index saved successfully")
+    
+    @staticmethod
+    def load_index(index_path: str) -> List[DocumentInfo]:
+        """
+        Load a previously saved index from JSON.
+        
+        This allows you to skip the indexing process if you've already
+        processed the documents once.
+        
+        Args:
+            index_path: Path to the saved index JSON file
+            
+        Returns:
+            List of DocumentInfo objects
+        """
+        logger.info(f"Loading index from: {index_path}")
+        
+        with open(index_path, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
+        
+        # Convert dictionaries back to dataclasses
+        documents = []
+        for doc_dict in index_data:
+            pages = [PageInfo(**page_dict) for page_dict in doc_dict['pages']]
+            doc_info = DocumentInfo(
+                doc_id=doc_dict['doc_id'],
+                summdesc=doc_dict['summdesc'],
+                pages=pages
+            )
+            documents.append(doc_info)
+        
+        logger.info(f"Loaded {len(documents)} documents from index")
+        return documents
+```
+
+Now let me create a practical example script that demonstrates how to use this indexer:
+
+```python
+# example_indexing.py
+import os
+from dotenv import load_dotenv
+from data_room_indexer import DataRoomIndexer, DocumentInfo
+from typing import Dict
+
+def create_sample_data_room_mapping() -> Dict[str, str]:
+    """
+    Create a mapping of document IDs to file paths.
+    
+    In a real application, you might scan a directory, query a database,
+    or receive this mapping from a document management system.
+    """
+    # This is just an example - adjust paths to your actual documents
+    documents = {
+        "DOC001": "/path/to/master_services_agreement.docx",
+        "DOC002": "/path/to/data_processing_agreement.pdf",
+        "DOC003": "/path/to/compliance_certification.pdf",
+        "DOC004": "/path/to/amendment_01.docx",
+        "DOC005": "/path/to/sow_project_alpha.xlsx",
+    }
+    
+    return documents
+
+def format_index_for_agent(documents: List[DocumentInfo]) -> str:
+    """
+    Format the index in a way that's easy to present to the main agent.
+    
+    This creates a human-readable summary that the main agent can use
+    for initial planning.
+    """
+    lines = ["# Data Room Index\n"]
+    
+    for doc in documents:
+        lines.append(f"## {doc.doc_id}")
+        lines.append(f"**Summary**: {doc.summdesc}")
+        lines.append(f"**Pages**: {len(doc.pages)}")
+        lines.append("")  # Blank line
+    
+    return "\n".join(lines)
+
+def main():
+    """
+    Main function demonstrating the complete indexing workflow.
+    """
+    # Load environment variables
+    load_dotenv()
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not openai_api_key:
+        raise ValueError("OPENAI_API_KEY environment variable not set")
+    
+    print("=" * 80)
+    print("DATA ROOM INDEXING SYSTEM")
+    print("=" * 80)
+    print()
+    
+    # Step 1: Initialize the indexer
+    print("[1/3] Initializing indexer...")
+    indexer = DataRoomIndexer(
+        openai_api_key=openai_api_key,
+        model="gpt-4o-mini",  # Fast and cost-effective for this task
+        dpi=150,  # Good balance of quality and file size
+        max_workers=3  # Process 3 pages in parallel
+    )
+    print("✓ Indexer initialized")
+    print()
+    
+    # Step 2: Define the documents to index
+    print("[2/3] Preparing document list...")
+    documents = create_sample_data_room_mapping()
+    print(f"✓ Found {len(documents)} documents to index")
+    print()
+    
+    # Step 3: Run the indexing process
+    print("[3/3] Indexing data room (this may take several minutes)...")
+    print("-" * 80)
+    
+    indexed_documents = indexer.index_data_room(
+        documents=documents,
+        output_path="data_room_index.json"  # Save for later use
+    )
+    
+    print("-" * 80)
+    print()
+    print("=" * 80)
+    print("INDEXING COMPLETE")
+    print("=" * 80)
+    print()
+    
+    # Display summary statistics
+    print("Summary Statistics:")
+    print(f"  Documents indexed: {len(indexed_documents)}")
+    print(f"  Total pages: {sum(len(doc.pages) for doc in indexed_documents)}")
+    print(f"  Index saved to: data_room_index.json")
+    print()
+    
+    # Display the formatted index
+    print("Data Room Index Preview:")
+    print("-" * 80)
+    print(format_index_for_agent(indexed_documents))
+    print("-" * 80)
+    print()
+    
+    # Show how to load the index later
+    print("To load this index later without re-processing:")
+    print("  from data_room_indexer import DataRoomIndexer")
+    print("  documents = DataRoomIndexer.load_index('data_room_index.json')")
+    print()
+
+if __name__ == "__main__":
+    main()
+```
+
+Now let me create the integration with our Legal Risk Analysis agent:
+
+```python
+# integrated_legal_risk_system.py
+import os
+from dotenv import load_dotenv
+from data_room_indexer import DataRoomIndexer, DocumentInfo
+from data_room_tools import DataRoom
+from main_agent import create_legal_risk_analysis_agent
+
+def convert_indexed_docs_to_dataroom(indexed_docs: List[DocumentInfo]) -> DataRoom:
+    """
+    Convert the output of the indexer into the DataRoom format expected by the agent.
+    
+    This is the bridge between the indexing system and the analysis system.
+    The indexer produces DocumentInfo objects with all the data, and this
+    function transforms them into the DataRoom structure that our agent tools expect.
+    """
+    documents = []
+    
+    for doc_info in indexed_docs:
+        doc_dict = {
+            "doc_id": doc_info.doc_id,
+            "summdesc": doc_info.summdesc,
+            "pages": [
+                {
+                    "page_num": page.page_num,
+                    "summdesc": page.summdesc,
+                    "page_image": page.page_image
+                }
+                for page in doc_info.pages
+            ]
+        }
+        documents.append(doc_dict)
+    
+    return DataRoom(documents)
+
+def run_complete_legal_risk_analysis(
+    document_paths: Dict[str, str],
+    openai_api_key: str,
+    tavily_api_key: str,
+    skip_indexing: bool = False,
+    index_path: str = "data_room_index.json"
+):
+    """
+    Run the complete end-to-end workflow: indexing and analysis.
+    
+    This function demonstrates how all the pieces fit together:
+    1. Index the raw documents (or load a previously saved index)
+    2. Convert the index into the DataRoom format
+    3. Create the Legal Risk Analysis agent
+    4. Run the analysis
+    
+    Args:
+        document_paths: Dictionary mapping doc IDs to file paths
+        openai_api_key: OpenAI API key
+        tavily_api_key: Tavily API key for web research
+        skip_indexing: If True, load a saved index instead of re-indexing
+        index_path: Path to save/load the index
+    """
+    print("=" * 80)
+    print("COMPLETE LEGAL RISK ANALYSIS SYSTEM")
+    print("=" * 80)
+    print()
+    
+    # Phase 1: Document Indexing
+    if skip_indexing and os.path.exists(index_path):
+        print("[Phase 1] Loading existing index...")
+        indexed_documents = DataRoomIndexer.load_index(index_path)
+        print(f"✓ Loaded index with {len(indexed_documents)} documents")
+    else:
+        print("[Phase 1] Indexing documents...")
+        indexer = DataRoomIndexer(
+            openai_api_key=openai_api_key,
+            model="gpt-4o-mini",
+            max_workers=3
+        )
+        indexed_documents = indexer.index_data_room(
+            documents=document_paths,
+            output_path=index_path
+        )
+        print(f"✓ Indexed {len(indexed_documents)} documents")
+    print()
+    
+    # Phase 2: Convert to DataRoom format
+    print("[Phase 2] Preparing data room for analysis...")
+    data_room = convert_indexed_docs_to_dataroom(indexed_documents)
+    print("✓ Data room ready")
+    print()
+    
+    # Phase 3: Create analysis agent
+    print("[Phase 3] Initializing Legal Risk Analysis Agent...")
+    agent = create_legal_risk_analysis_agent(
+        data_room=data_room,
+        tavily_api_key=tavily_api_key
+    )
+    print("✓ Agent initialized")
+    print()
+    
+    # Phase 4: Run analysis
+    print("[Phase 4] Running legal risk analysis...")
+    print("-" * 80)
+    
+    # Format the data room index for the agent
+    data_room_index = "\n".join([
+        f"## {doc.doc_id}\n**Summary**: {doc.summdesc}\n**Pages**: {len(doc.pages)}\n"
+        for doc in indexed_documents
+    ])
+    
+    user_request = f"""Please conduct a comprehensive legal risk analysis of the following data room.
+
+{data_room_index}
+
+Analyze all documents to identify contractual risks, regulatory compliance issues, 
+litigation exposure, intellectual property concerns, and operational risks.
+
+For each risk identified, assess its severity and likelihood, cite specific evidence 
+from the documents, and provide recommended mitigations.
+
+Once analysis is complete, create both a professional Word document report and an 
+interactive HTML dashboard for presenting the findings."""
+    
+    result = agent.invoke({
+        "messages": [{"role": "user", "content": user_request}]
+    })
+    
+    print("-" * 80)
+    print()
+    print("=" * 80)
+    print("ANALYSIS COMPLETE")
+    print("=" * 80)
+    print()
+    print(result["messages"][-1].content)
+    print()
+
+if __name__ == "__main__":
+    load_dotenv()
+    
+    # Example document paths
+    documents = {
+        "DOC001": "/path/to/document1.docx",
+        "DOC002": "/path/to/document2.pdf",
+        # Add your actual documents here
+    }
+    
+    run_complete_legal_risk_analysis(
+        document_paths=documents,
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        tavily_api_key=os.getenv("TAVILY_API_KEY"),
+        skip_indexing=False  # Set to True to reuse a saved index
+    )
+```
+
+## Understanding the Complete System Flow
+
+Now that we have all the pieces built, let me walk you through what happens when you run this system from end to end, so you can understand how the indexing feeds into the analysis.
+
+When you first run the system with a collection of documents, the indexing phase begins. The system takes each document file—whether it's a Word document, Excel spreadsheet, PowerPoint presentation, or already a PDF—and normalizes it to PDF format using LibreOffice. This conversion step is crucial because it gives us a consistent format to work with downstream, regardless of what the original file type was.
+
+Once we have PDFs, the system opens each one and renders every page as a high-resolution image. This image-based approach is powerful because it preserves all the visual information in the document. Tables maintain their structure, charts remain readable, formatting that conveys meaning is retained, and even handwritten annotations or signatures are captured. Pure text extraction would lose all of this contextual information.
+
+With the page images in hand, the system sends each one to GPT-4o-mini (or whichever model you configured) with a carefully crafted prompt that asks the model to describe what it sees. The model analyzes each page and generates a concise summary—typically two to three sentences—that captures the essential content. Because we're processing pages in parallel using a ThreadPoolExecutor, a ten-page document might have all its pages analyzed simultaneously, significantly speeding up the indexing process.
+
+After all pages in a document have been summarized, the system takes another pass with the language model, this time asking it to synthesize all those individual page summaries into a coherent document-level summary. This creates the hierarchical structure that makes the system so powerful—you have both the high-level view for strategic planning and the detailed page-level view for deep analysis.
+
+The indexing process produces a structured JSON file containing everything the analysis agent needs: document IDs, document summaries, page numbers, page summaries, and base64-encoded page images. This JSON file can be saved and reloaded later, so you don't need to re-process documents if you want to run additional analyses.
+
+When the analysis phase begins, the system converts this JSON structure into the DataRoom format that our agent tools expect. The main Legal Risk Analysis agent receives the high-level data room index, which shows all the documents and their summaries. The agent uses this information to create its strategic plan, deciding which documents to analyze and in what order.
+
+As the agent executes its plan and spawns Analysis Subagents, those subagents use the data room tools to retrieve documents. When a subagent calls `get_document`, it receives the document summary and all page summaries—information that was prepared during indexing. When it calls `get_document_pages` to examine specific pages in detail, it receives the actual page images that were captured during indexing. The subagent can then use its own vision capabilities to perform detailed analysis of those pages, looking for specific clauses, identifying risks, and gathering evidence.
+
+This two-stage architecture—indexing followed by analysis—provides several important benefits. First, it amortizes the cost of document processing. Once you've indexed a data room, you can run multiple analyses on it without re-processing the images. Second, it creates a clean separation of concerns. The indexing system focuses purely on understanding what documents contain, while the analysis system focuses on evaluating legal risk. Third, it enables token-efficient operation. The indexing phase uses a smaller, faster model to create summaries that help the analysis agent work more efficiently. Fourth, it provides a persistent data structure that can be versioned, archived, and used for audit trails.
+
+## Cost and Performance Considerations
+
+Running this indexing system on a real data room involves meaningful API costs, so it's worth understanding the economics. The primary cost drivers are the vision API calls for page summarization and the token usage for document summarization. Let's break down what you can expect.
+
+For page summarization, each page requires sending a high-resolution image to the API. A typical document page at 150 DPI might be around fifteen hundred image tokens. With GPT-4o-mini, that's roughly two cents per page for the image input, plus a small amount for the generated summary text. So a hundred-page document might cost around two dollars to index at the page level.
+
+For document summarization, you're sending text (the concatenated page summaries) rather than images, which is much cheaper. A ten-page document might have twenty sentences of page summaries, which costs just a fraction of a cent to process. The document-level summarization is negligible compared to the page-level vision costs.
+
+If you're indexing a data room with five hundred pages across twenty documents, you might spend around ten dollars on the complete indexing process using GPT-4o-mini. If you need higher quality summaries and use GPT-4o instead, that cost would be roughly ten times higher—around one hundred dollars for the same data room. The trade-off is that GPT-4o provides more nuanced understanding of complex legal language and visual elements.
+
+The time required for indexing depends on your parallelization settings. With max_workers set to three, you process three pages simultaneously. Each page takes a few seconds to summarize. So five hundred pages might take twenty to thirty minutes to fully index. You can increase max_workers to speed this up, but be mindful of API rate limits.
+
+One strategic consideration is whether to index everything upfront or just-in-time. For documents that you analyze repeatedly, upfront indexing makes sense. You pay the cost once and then reuse the index for multiple analyses. For documents that might never be analyzed, you could consider a hybrid approach where you index just the first page or two of each document initially to create a preliminary index, then do full deep indexing only for documents that the agent decides to analyze in detail.
+
+## Practical Deployment Recommendations
+
+When deploying this system in a production environment, several practical considerations will improve reliability and user experience. Let me share some patterns I've seen work well in real implementations.
+
+For error handling, you want the system to be resilient to individual document failures. If one document in a twenty-document data room fails to index—maybe it's corrupted or in an unsupported format—the system should log the error, note which document failed, and continue processing the others. The implementation I showed you does this by wrapping each document processing call in a try-except block. In production, you'd also want to record these failures in a structured way so that users can review what couldn't be indexed and potentially fix the underlying issues.
+
+For large data rooms, consider implementing a progress tracking system. The indexing process can take significant time, and users need visibility into what's happening. You might implement a simple progress callback that reports completion of each document, or something more sophisticated that tracks page-level progress and estimates time remaining. The logging statements in my implementation provide a foundation for this—you could enhance them to write progress updates to a database or message queue that a frontend could poll.
+
+For document storage, think carefully about how you handle the base64-encoded images in your index. A five-hundred-page data room might produce a JSON file that's several hundred megabytes in size. That's manageable but not trivial. For very large data rooms, you might want to store the images separately in an object store like S3 and include only references in the JSON index. This would make the index itself smaller and faster to load, at the cost of requiring additional infrastructure.
+
+For quality assurance, consider implementing spot-checking mechanisms. After indexing completes, randomly sample some pages and have a human reviewer verify that the summaries accurately capture the content. This helps you tune your prompts and catch any systematic issues with how the model is understanding your documents. You might also implement automated checks—for example, flagging any page summary that's suspiciously short or contains generic text like "unable to determine content."
+
+For version control, treat your indexes as versioned artifacts. If you re-index a data room after documents change, save the new index with a version number or timestamp so you can track how the data room evolved over time. This becomes important for audit trails and understanding how analysis results might differ between versions of the same data room.
+
+For caching and optimization, consider that document conversion to PDF is relatively expensive computationally. If you're repeatedly indexing similar sets of documents, maintain a cache of converted PDFs keyed by file hash. This way, if a document hasn't changed, you can skip the conversion step entirely. Similarly, you might cache page images to avoid re-rendering if you need to re-index just to update summaries with a different model or prompt.
+
+## Conclusion and Next Steps
+
+You now have a complete, production-ready document indexing system that transforms unstructured files into a richly annotated data room that intelligent agents can navigate efficiently. The indexing pipeline handles format conversion, visual content extraction, multi-level summarization, and structured data generation, all while being resilient to errors and optimized for cost and performance.
+
+This indexing system is the essential first step in your legal risk analysis workflow. Without it, your analysis agent would be flying blind, unable to strategically plan its work or efficiently access document content. With it, the agent has a detailed map of the territory, allowing it to make informed decisions about what to analyze and where to focus its attention.
+
+The architecture we've built is also extensible. You could add additional metadata extraction during indexing—for example, identifying document dates, parties, or document types automatically. You could enhance the summarization prompts to extract specific structured data that your analysis agents commonly need. You could implement quality scoring for summaries and flag documents that might need human review before analysis. You could add optical character recognition for scanned documents to improve text searchability alongside the visual analysis.
+
+The complete system—indexing plus analysis—represents a sophisticated application of AI technology to a real-world professional problem. It demonstrates how to combine multiple AI capabilities (vision, language understanding, structured generation) with traditional software engineering (parallel processing, data transformation, error handling) to create something that provides genuine value in high-stakes domains like legal risk assessment.
