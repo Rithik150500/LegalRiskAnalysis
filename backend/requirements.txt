@@ -27,3 +27,6 @@ tavily-python
 python-docx
 langgraph
 langchain-anthropic
+
+# Anthropic API client
+anthropic>=0.18.0

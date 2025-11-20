@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 # Add paths for imports
@@ -18,6 +19,9 @@ from models import (
     AnalysisCreate, AnalysisResponse, AnalysisDetail, AnalysisDocuments,
     RiskCategory, RiskSeverity, RiskLikelihood
 )
+from services.analysis_service import create_analysis_service
+from services.report_generator import create_report_generator
+from services.dashboard_generator import create_dashboard_generator
 
 router = APIRouter()
 
@@ -50,97 +54,157 @@ def run_analysis_task(analysis_id: str, document_ids: List[str], db_url: str):
         # Get documents
         documents = db.query(DocumentModel).filter(DocumentModel.doc_id.in_(document_ids)).all()
 
-        # Simulate analysis phases (in production, this would call the actual agent)
+        # Progress tracking
+        import time
+
+        # Phase 1: Load documents
+        analysis.current_step = "Loading documents..."
+        analysis.progress = 10
+        db.commit()
+        time.sleep(0.3)
+
+        # Prepare document data for analysis
+        docs_data = []
+        for doc in documents:
+            docs_data.append({
+                "doc_id": doc.doc_id,
+                "original_filename": doc.original_filename,
+                "summary": doc.summary,
+                "page_count": doc.page_count,
+                "pages_data": doc.pages_data
+            })
+
+        # Phase 2: Run AI analysis
+        analysis.current_step = "Analyzing documents with AI..."
+        analysis.progress = 20
+        db.commit()
+
+        # Create analysis service and run analysis
+        analysis_service = create_analysis_service()
+
+        # Update progress during analysis phases
         phases = [
-            ("Loading documents...", 10),
-            ("Analyzing contractual risks...", 25),
-            ("Analyzing regulatory compliance...", 40),
+            ("Analyzing contractual risks...", 30),
+            ("Analyzing regulatory compliance...", 45),
             ("Analyzing litigation exposure...", 55),
-            ("Analyzing IP concerns...", 70),
-            ("Analyzing operational risks...", 85),
-            ("Generating report...", 95),
+            ("Analyzing IP concerns...", 65),
+            ("Analyzing operational risks...", 75),
         ]
 
-        # Generate mock risk data for demonstration
-        risks_data = []
-        risk_counter = 1
-
-        for doc in documents:
-            # Generate sample risks for each document
-            sample_risks = [
-                {
-                    "risk_id": f"RISK_{risk_counter:03d}",
-                    "category": RiskCategory.CONTRACTUAL,
-                    "title": f"Liability limitation in {doc.original_filename}",
-                    "description": "The liability cap may be insufficient to cover potential damages in case of service failure.",
-                    "severity": RiskSeverity.HIGH,
-                    "likelihood": RiskLikelihood.POSSIBLE,
-                    "evidence": [{"doc_id": doc.doc_id, "page_num": 1, "citation": "Liability shall not exceed fees paid in prior 12 months"}],
-                    "legal_basis": "Contract Law - Limitation of Liability Clauses",
-                    "recommended_mitigation": "Negotiate higher liability caps or carve-outs for gross negligence"
-                },
-                {
-                    "risk_id": f"RISK_{risk_counter + 1:03d}",
-                    "category": RiskCategory.REGULATORY,
-                    "title": f"Data protection compliance in {doc.original_filename}",
-                    "description": "Potential gaps in GDPR compliance for cross-border data transfers.",
-                    "severity": RiskSeverity.MEDIUM,
-                    "likelihood": RiskLikelihood.LIKELY,
-                    "evidence": [{"doc_id": doc.doc_id, "page_num": 2, "citation": "Data may be processed in any jurisdiction"}],
-                    "legal_basis": "GDPR Article 44-49",
-                    "recommended_mitigation": "Implement Standard Contractual Clauses for international transfers"
-                },
-                {
-                    "risk_id": f"RISK_{risk_counter + 2:03d}",
-                    "category": RiskCategory.OPERATIONAL,
-                    "title": f"Service continuity risk in {doc.original_filename}",
-                    "description": "No clear disaster recovery or business continuity provisions.",
-                    "severity": RiskSeverity.MEDIUM,
-                    "likelihood": RiskLikelihood.POSSIBLE,
-                    "evidence": [{"doc_id": doc.doc_id, "page_num": 1, "citation": "Service availability target: 99.9%"}],
-                    "legal_basis": "Industry best practices for service continuity",
-                    "recommended_mitigation": "Request DR/BCP documentation and add SLA penalties"
-                }
-            ]
-
-            risk_counter += 3
-            risks_data.extend(sample_risks)
-
-        # Simulate progress through phases
-        import time
         for step, progress in phases:
             analysis.current_step = step
             analysis.progress = progress
             db.commit()
-            time.sleep(0.5)  # Simulate work
+            time.sleep(0.3)
+
+        # Perform the actual analysis
+        analysis_result = analysis_service.analyze_documents(docs_data)
+
+        analysis.current_step = "Processing analysis results..."
+        analysis.progress = 80
+        db.commit()
+
+        # Extract risks from analysis result
+        risks_data = analysis_result.get("risks", [])
+        analysis_summary = analysis_result.get("analysis_summary", f"Analysis of {len(documents)} documents")
 
         # Save risks to database
         for risk_data in risks_data:
+            # Map string severity/likelihood to enums
+            severity_map = {
+                "Critical": RiskSeverity.CRITICAL,
+                "High": RiskSeverity.HIGH,
+                "Medium": RiskSeverity.MEDIUM,
+                "Low": RiskSeverity.LOW
+            }
+            likelihood_map = {
+                "Very Likely": RiskLikelihood.VERY_LIKELY,
+                "Likely": RiskLikelihood.LIKELY,
+                "Possible": RiskLikelihood.POSSIBLE,
+                "Unlikely": RiskLikelihood.UNLIKELY
+            }
+            category_map = {
+                "Contractual": RiskCategory.CONTRACTUAL,
+                "Regulatory": RiskCategory.REGULATORY,
+                "Litigation": RiskCategory.LITIGATION,
+                "IP": RiskCategory.IP,
+                "Operational": RiskCategory.OPERATIONAL
+            }
+
             db_risk = RiskModel(
-                risk_id=risk_data["risk_id"],
+                risk_id=risk_data.get("risk_id", f"RISK_{uuid.uuid4().hex[:6].upper()}"),
                 analysis_id=analysis.id,
-                category=risk_data["category"],
-                title=risk_data["title"],
-                description=risk_data["description"],
-                severity=risk_data["severity"],
-                likelihood=risk_data["likelihood"],
-                evidence=risk_data["evidence"],
-                legal_basis=risk_data["legal_basis"],
-                recommended_mitigation=risk_data["recommended_mitigation"]
+                category=category_map.get(risk_data.get("category", "Operational"), RiskCategory.OPERATIONAL),
+                title=risk_data.get("title", "Untitled Risk"),
+                description=risk_data.get("description", ""),
+                severity=severity_map.get(risk_data.get("severity", "Medium"), RiskSeverity.MEDIUM),
+                likelihood=likelihood_map.get(risk_data.get("likelihood", "Possible"), RiskLikelihood.POSSIBLE),
+                evidence=risk_data.get("evidence", []),
+                legal_basis=risk_data.get("legal_basis", ""),
+                recommended_mitigation=risk_data.get("recommended_mitigation", "")
             )
             db.add(db_risk)
 
+        db.commit()
+
+        # Phase 3: Generate report
+        analysis.current_step = "Generating Word report..."
+        analysis.progress = 85
+        db.commit()
+
+        # Define output paths
+        outputs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs")
+        os.makedirs(outputs_dir, exist_ok=True)
+
+        report_filename = f"{analysis_id}_report.docx"
+        dashboard_filename = f"{analysis_id}_dashboard.html"
+        report_path = os.path.join(outputs_dir, report_filename)
+        dashboard_path = os.path.join(outputs_dir, dashboard_filename)
+
+        # Generate Word report
+        report_generator = create_report_generator()
+        report_generator.generate_report(
+            analysis_id=analysis_id,
+            analysis_name=analysis.name,
+            analysis_summary=analysis_summary,
+            documents=docs_data,
+            risks=risks_data,
+            output_path=report_path
+        )
+
+        # Phase 4: Generate dashboard
+        analysis.current_step = "Generating interactive dashboard..."
+        analysis.progress = 95
+        db.commit()
+
+        # Generate HTML dashboard
+        dashboard_generator = create_dashboard_generator()
+        dashboard_generator.generate_dashboard(
+            analysis_id=analysis_id,
+            analysis_name=analysis.name,
+            analysis_summary=analysis_summary,
+            documents=docs_data,
+            risks=risks_data,
+            output_path=dashboard_path
+        )
+
         # Store result data
         result_data = {
-            "analysis_summary": f"Comprehensive legal risk analysis of {len(documents)} documents",
+            "analysis_summary": analysis_summary,
             "documents_analyzed": document_ids,
-            "risks_identified": risks_data,
             "total_risks": len(risks_data),
             "by_severity": {
-                "Critical": len([r for r in risks_data if r["severity"] == RiskSeverity.CRITICAL]),
-                "High": len([r for r in risks_data if r["severity"] == RiskSeverity.HIGH]),
-                "Medium": len([r for r in risks_data if r["severity"] == RiskSeverity.MEDIUM]),
-                "Low": len([r for r in risks_data if r["severity"] == RiskSeverity.LOW]),
+                "Critical": len([r for r in risks_data if r.get("severity") == "Critical"]),
+                "High": len([r for r in risks_data if r.get("severity") == "High"]),
+                "Medium": len([r for r in risks_data if r.get("severity") == "Medium"]),
+                "Low": len([r for r in risks_data if r.get("severity") == "Low"]),
+            },
+            "by_category": {
+                "Contractual": len([r for r in risks_data if r.get("category") == "Contractual"]),
+                "Regulatory": len([r for r in risks_data if r.get("category") == "Regulatory"]),
+                "Litigation": len([r for r in risks_data if r.get("category") == "Litigation"]),
+                "IP": len([r for r in risks_data if r.get("category") == "IP"]),
+                "Operational": len([r for r in risks_data if r.get("category") == "Operational"]),
             }
         }
 
@@ -150,12 +214,15 @@ def run_analysis_task(analysis_id: str, document_ids: List[str], db_url: str):
         analysis.progress = 100
         analysis.current_step = "Analysis complete"
         analysis.result_data = result_data
-        analysis.report_path = f"/outputs/{analysis_id}_report.docx"
-        analysis.dashboard_path = f"/outputs/{analysis_id}_dashboard.html"
+        analysis.report_path = f"/api/analyses/{analysis_id}/download/report"
+        analysis.dashboard_path = f"/api/analyses/{analysis_id}/download/dashboard"
         db.commit()
 
     except Exception as e:
         # Handle errors
+        import traceback
+        print(f"Analysis error: {e}")
+        print(traceback.format_exc())
         analysis = db.query(AnalysisModel).filter(AnalysisModel.analysis_id == analysis_id).first()
         if analysis:
             analysis.status = AnalysisStatus.FAILED
@@ -391,3 +458,59 @@ async def delete_analysis(analysis_id: str, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": f"Analysis {analysis_id} deleted successfully"}
+
+
+@router.get("/{analysis_id}/download/report")
+async def download_report(analysis_id: str, db: Session = Depends(get_db)):
+    """Download the Word report for an analysis"""
+    analysis = db.query(AnalysisModel).filter(
+        AnalysisModel.analysis_id == analysis_id
+    ).first()
+
+    if not analysis:
+        raise HTTPException(status_code=404, detail=f"Analysis {analysis_id} not found")
+
+    if analysis.status != AnalysisStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Analysis is not yet completed")
+
+    # Build file path
+    outputs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs")
+    report_filename = f"{analysis_id}_report.docx"
+    report_path = os.path.join(outputs_dir, report_filename)
+
+    if not os.path.exists(report_path):
+        raise HTTPException(status_code=404, detail="Report file not found")
+
+    return FileResponse(
+        path=report_path,
+        filename=f"{analysis.name.replace(' ', '_')}_Legal_Risk_Report.docx",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+
+@router.get("/{analysis_id}/download/dashboard")
+async def download_dashboard(analysis_id: str, db: Session = Depends(get_db)):
+    """Download the interactive HTML dashboard for an analysis"""
+    analysis = db.query(AnalysisModel).filter(
+        AnalysisModel.analysis_id == analysis_id
+    ).first()
+
+    if not analysis:
+        raise HTTPException(status_code=404, detail=f"Analysis {analysis_id} not found")
+
+    if analysis.status != AnalysisStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Analysis is not yet completed")
+
+    # Build file path
+    outputs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs")
+    dashboard_filename = f"{analysis_id}_dashboard.html"
+    dashboard_path = os.path.join(outputs_dir, dashboard_filename)
+
+    if not os.path.exists(dashboard_path):
+        raise HTTPException(status_code=404, detail="Dashboard file not found")
+
+    return FileResponse(
+        path=dashboard_path,
+        filename=f"{analysis.name.replace(' ', '_')}_Legal_Risk_Dashboard.html",
+        media_type="text/html"
+    )
