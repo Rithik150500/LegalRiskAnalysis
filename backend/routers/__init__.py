@@ -1,2 +1,2 @@
 # routers/__init__.py
-from . import documents, analyses, dashboard
+from . import documents, analyses, dashboard, indexing

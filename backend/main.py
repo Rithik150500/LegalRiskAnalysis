@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import init_db
-from routers import documents, analyses, dashboard
+from routers import documents, analyses, dashboard, indexing
 
 # Load environment variables
 load_dotenv()
@@ -48,6 +48,7 @@ app.mount("/outputs", StaticFiles(directory=outputs_dir), name="outputs")
 app.include_router(documents.router, prefix="/api/documents", tags=["Documents"])
 app.include_router(analyses.router, prefix="/api/analyses", tags=["Analyses"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
+app.include_router(indexing.router, prefix="/api/indexing", tags=["Indexing"])
 
 @app.on_event("startup")
 async def startup_event():
